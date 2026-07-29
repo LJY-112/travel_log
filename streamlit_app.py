@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import folium
 import pandas as pd
 import streamlit as st
 from folium.plugins import Fullscreen, MarkerCluster
 from streamlit_folium import st_folium
+from supabase import Client, create_client
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "travel_log.db"
@@ -182,164 +185,185 @@ st.markdown(
 )
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    if column not in columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
-def canonical_subregion(province: str, raw_city: str) -> Optional[str]:
-    """기존 자유 입력 도시명을 새 시·군·구 목록에 가능한 범위에서 연결합니다."""
-    raw = (raw_city or "").strip()
-    options = ADMIN_AREAS.get(province, [])
-    if raw in options:
-        return raw
-    for option in options:
-        if raw.startswith(option) or option in raw:
-            return option
-    return None
-
-
-def init_db() -> None:
-    with get_conn() as conn:
-        # 구버전 호환용 테이블은 유지합니다.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS region_status (
-                region TEXT PRIMARY KEY,
-                status TEXT NOT NULL DEFAULT '미방문',
-                updated_at TEXT NOT NULL
-            )
-            """
+def get_app_config() -> tuple[str, str, str]:
+    """Streamlit Secrets에서 Supabase와 앱 비밀번호 설정을 읽습니다."""
+    try:
+        supabase_config = st.secrets["supabase"]
+        app_config = st.secrets["app"]
+        url = str(supabase_config["url"]).strip()
+        secret_key = str(supabase_config["secret_key"]).strip()
+        app_password = str(app_config["password"])
+    except (FileNotFoundError, KeyError) as exc:
+        st.error("Supabase 연결 정보가 설정되지 않았습니다.")
+        st.code(
+            '[supabase]\n'
+            'url = "https://YOUR_PROJECT_REF.supabase.co"\n'
+            'secret_key = "sb_secret_YOUR_SECRET_KEY"\n\n'
+            '[app]\n'
+            'password = "나만의-접속-비밀번호"',
+            language="toml",
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS area_status (
-                province TEXT NOT NULL,
-                subregion TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT '미방문',
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (province, subregion)
-            )
-            """
+        st.info(
+            "로컬에서는 프로젝트 폴더의 `.streamlit/secrets.toml`에 저장하고, "
+            "Streamlit Community Cloud에서는 App settings → Secrets에 같은 내용을 입력하세요."
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS places (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                region TEXT NOT NULL,
-                city TEXT NOT NULL,
-                place_name TEXT NOT NULL,
-                category TEXT NOT NULL,
-                visit_date TEXT,
-                rating INTEGER NOT NULL DEFAULT 3,
-                one_line_review TEXT NOT NULL,
-                latitude REAL NOT NULL,
-                longitude REAL NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        ensure_column(conn, "places", "updated_at", "TEXT")
+        st.stop()
+        raise RuntimeError("unreachable") from exc
 
-        now = datetime.now().isoformat(timespec="seconds")
-        for province, subregions in ADMIN_AREAS.items():
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO region_status(region, status, updated_at)
-                VALUES (?, '미방문', ?)
-                """,
-                (province, now),
-            )
-            for subregion in subregions:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO area_status(province, subregion, status, updated_at)
-                    VALUES (?, ?, '미방문', ?)
-                    """,
-                    (province, subregion, now),
-                )
+    if not url.startswith("https://") or not secret_key or not app_password:
+        st.error("Secrets의 Supabase URL, secret_key, 앱 비밀번호를 확인해 주세요.")
+        st.stop()
+    return url, secret_key, app_password
 
-        # 구버전의 장소 기록이 있으면 일치하는 시·군·구만 자동으로 '가본 곳' 처리합니다.
-        legacy_places = conn.execute("SELECT region, city FROM places").fetchall()
-        for row in legacy_places:
-            matched = canonical_subregion(row["region"], row["city"])
-            if matched:
-                conn.execute(
-                    """
-                    UPDATE area_status
-                    SET status = '가본 곳', updated_at = ?
-                    WHERE province = ? AND subregion = ? AND status = '미방문'
-                    """,
-                    (now, row["region"], matched),
-                )
-        conn.commit()
+
+@st.cache_resource(show_spinner=False)
+def get_supabase_client(url: str, secret_key: str) -> Client:
+    return create_client(url, secret_key)
+
+
+def require_app_password(expected_password: str) -> None:
+    """공개 Streamlit 주소에서 다른 사람이 기록을 수정하지 못하도록 보호합니다."""
+    expected_hash = hashlib.sha256(expected_password.encode("utf-8")).hexdigest()
+    if st.session_state.get("travel_auth_hash") == expected_hash:
+        return
+
+    st.markdown(
+        """
+        <div class="travel-title">
+            <span class="travel-title-icon">🔐</span>
+            <span class="travel-title-text">여행 기록 로그인</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="travel-sub">Supabase에 저장된 개인 여행 기록을 열려면 비밀번호를 입력하세요.</div>',
+        unsafe_allow_html=True,
+    )
+    with st.form("travel_password_form"):
+        entered = st.text_input("접속 비밀번호", type="password")
+        submitted = st.form_submit_button("로그인", type="primary", use_container_width=True)
+        if submitted:
+            if hmac.compare_digest(entered, expected_password):
+                st.session_state["travel_auth_hash"] = expected_hash
+                st.rerun()
+            st.error("비밀번호가 올바르지 않습니다.")
+    st.stop()
+
+
+def verify_supabase_schema(client: Client) -> None:
+    """필수 테이블 존재 여부와 접속 권한을 확인합니다."""
+    try:
+        client.table("area_status").select("province", count="exact").limit(1).execute()
+        client.table("places").select("id", count="exact").limit(1).execute()
+    except Exception as exc:
+        st.error("Supabase에는 연결했지만 필요한 테이블을 확인할 수 없습니다.")
+        st.info("프로젝트에 포함된 `supabase_schema.sql`을 Supabase SQL Editor에서 먼저 실행하세요.")
+        with st.expander("오류 세부 정보"):
+            st.code(str(exc))
+        st.stop()
+
+
+def ensure_area_reference_rows(client: Client) -> None:
+    """새 프로젝트의 area_status에 229개 시·군·구 기준 행을 한 번 채웁니다."""
+    try:
+        response = client.table("area_status").select("province,subregion").execute()
+        existing = {
+            (str(row["province"]), str(row["subregion"]))
+            for row in (response.data or [])
+        }
+        now = now_utc_iso()
+        missing = [
+            {
+                "province": province,
+                "subregion": subregion,
+                "status": "미방문",
+                "updated_at": now,
+            }
+            for province, subregions in ADMIN_AREAS.items()
+            for subregion in subregions
+            if (province, subregion) not in existing
+        ]
+        if missing:
+            client.table("area_status").insert(missing).execute()
+    except Exception as exc:
+        st.error("시·군·구 초기 데이터를 Supabase에 생성하지 못했습니다.")
+        with st.expander("오류 세부 정보"):
+            st.code(str(exc))
+        st.stop()
 
 
 def load_area_status(province: Optional[str] = None) -> pd.DataFrame:
-    query = "SELECT province, subregion, status, updated_at FROM area_status"
-    params: tuple[object, ...] = ()
+    client = st.session_state["supabase_client"]
+    query = client.table("area_status").select("province,subregion,status,updated_at")
     if province:
-        query += " WHERE province = ?"
-        params = (province,)
-    query += " ORDER BY province, subregion"
-    with get_conn() as conn:
-        return pd.read_sql_query(query, conn, params=params)
+        query = query.eq("province", province)
+    response = query.order("province").order("subregion").execute()
+    columns = ["province", "subregion", "status", "updated_at"]
+    return pd.DataFrame(response.data or [], columns=columns)
 
 
 def update_area_status(province: str, subregion: str, status: str) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO area_status(province, subregion, status, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(province, subregion) DO UPDATE SET
-                status = excluded.status,
-                updated_at = excluded.updated_at
-            """,
-            (province, subregion, status, datetime.now().isoformat(timespec="seconds")),
-        )
-        conn.commit()
+    client = st.session_state["supabase_client"]
+    client.table("area_status").upsert(
+        {
+            "province": province,
+            "subregion": subregion,
+            "status": status,
+            "updated_at": now_utc_iso(),
+        },
+        on_conflict="province,subregion",
+    ).execute()
 
 
 def update_area_statuses(rows: pd.DataFrame) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
+    client = st.session_state["supabase_client"]
+    now = now_utc_iso()
     payload = [
-        (str(row.province), str(row.subregion), str(row.status), now)
+        {
+            "province": str(row.province),
+            "subregion": str(row.subregion),
+            "status": str(row.status),
+            "updated_at": now,
+        }
         for row in rows.itertuples(index=False)
     ]
-    with get_conn() as conn:
-        conn.executemany(
-            """
-            INSERT INTO area_status(province, subregion, status, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(province, subregion) DO UPDATE SET
-                status = excluded.status,
-                updated_at = excluded.updated_at
-            """,
+    if payload:
+        client.table("area_status").upsert(
             payload,
-        )
-        conn.commit()
+            on_conflict="province,subregion",
+        ).execute()
 
 
 def load_places() -> pd.DataFrame:
-    with get_conn() as conn:
-        return pd.read_sql_query(
-            """
-            SELECT id, region, city, place_name, category, visit_date, rating,
-                   one_line_review, latitude, longitude, created_at,
-                   COALESCE(updated_at, created_at) AS updated_at
-            FROM places
-            ORDER BY COALESCE(visit_date, created_at) DESC, id DESC
-            """,
-            conn,
+    client = st.session_state["supabase_client"]
+    columns = [
+        "id", "legacy_sqlite_id", "region", "city", "place_name", "category",
+        "visit_date", "rating", "one_line_review", "latitude", "longitude",
+        "created_at", "updated_at",
+    ]
+    rows: list[dict[str, Any]] = []
+    page_size = 1000
+    start = 0
+    while True:
+        response = (
+            client.table("places")
+            .select(",".join(columns))
+            .order("visit_date", desc=True, nullsfirst=False)
+            .order("id", desc=True)
+            .range(start, start + page_size - 1)
+            .execute()
         )
+        batch = response.data or []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        start += page_size
+    return pd.DataFrame(rows, columns=columns)
 
 
 def add_place(
@@ -353,22 +377,23 @@ def add_place(
     latitude: float,
     longitude: float,
 ) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO places(
-                region, city, place_name, category, visit_date, rating,
-                one_line_review, latitude, longitude, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                region, city, place_name.strip(), category, visit_date,
-                int(rating), review.strip(), float(latitude), float(longitude), now, now,
-            ),
-        )
-        conn.commit()
+    client = st.session_state["supabase_client"]
+    now = now_utc_iso()
+    client.table("places").insert(
+        {
+            "region": region,
+            "city": city,
+            "place_name": place_name.strip(),
+            "category": category,
+            "visit_date": visit_date,
+            "rating": int(rating),
+            "one_line_review": review.strip(),
+            "latitude": float(latitude),
+            "longitude": float(longitude),
+            "created_at": now,
+            "updated_at": now,
+        }
+    ).execute()
     update_area_status(region, city, "가본 곳")
 
 
@@ -384,28 +409,146 @@ def update_place(
     latitude: float,
     longitude: float,
 ) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE places
-            SET region = ?, city = ?, place_name = ?, category = ?, visit_date = ?,
-                rating = ?, one_line_review = ?, latitude = ?, longitude = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                region, city, place_name.strip(), category, visit_date, int(rating),
-                review.strip(), float(latitude), float(longitude),
-                datetime.now().isoformat(timespec="seconds"), int(place_id),
-            ),
+    client = st.session_state["supabase_client"]
+    (
+        client.table("places")
+        .update(
+            {
+                "region": region,
+                "city": city,
+                "place_name": place_name.strip(),
+                "category": category,
+                "visit_date": visit_date,
+                "rating": int(rating),
+                "one_line_review": review.strip(),
+                "latitude": float(latitude),
+                "longitude": float(longitude),
+                "updated_at": now_utc_iso(),
+            }
         )
-        conn.commit()
+        .eq("id", int(place_id))
+        .execute()
+    )
     update_area_status(region, city, "가본 곳")
 
 
 def delete_place(place_id: int) -> None:
-    with get_conn() as conn:
-        conn.execute("DELETE FROM places WHERE id = ?", (int(place_id),))
-        conn.commit()
+    client = st.session_state["supabase_client"]
+    client.table("places").delete().eq("id", int(place_id)).execute()
+
+
+def sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def sqlite_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def migrate_sqlite_to_supabase() -> tuple[int, int]:
+    """기존 travel_log.db를 반복 실행해도 중복 없이 Supabase로 옮깁니다."""
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"SQLite 파일을 찾을 수 없습니다: {DB_PATH}")
+
+    client = st.session_state["supabase_client"]
+    imported_area_count = 0
+    imported_place_count = 0
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+
+        if sqlite_table_exists(conn, "area_status"):
+            area_rows = conn.execute(
+                "SELECT province, subregion, status, updated_at FROM area_status"
+            ).fetchall()
+            area_payload = [
+                {
+                    "province": str(row["province"]),
+                    "subregion": str(row["subregion"]),
+                    "status": str(row["status"]),
+                    "updated_at": str(row["updated_at"] or now_utc_iso()),
+                }
+                for row in area_rows
+                if str(row["province"]) in ADMIN_AREAS
+                and str(row["subregion"]) in ADMIN_AREAS[str(row["province"])]
+            ]
+            if area_payload:
+                client.table("area_status").upsert(
+                    area_payload,
+                    on_conflict="province,subregion",
+                ).execute()
+                imported_area_count = len(area_payload)
+
+        if sqlite_table_exists(conn, "places"):
+            cols = sqlite_columns(conn, "places")
+            select_columns = [
+                "id", "region", "city", "place_name", "category", "visit_date",
+                "rating", "one_line_review", "latitude", "longitude", "created_at",
+            ]
+            if "updated_at" in cols:
+                select_columns.append("updated_at")
+            place_rows = conn.execute(
+                f"SELECT {','.join(select_columns)} FROM places ORDER BY id"
+            ).fetchall()
+
+            payload: list[dict[str, Any]] = []
+            visited_pairs: set[tuple[str, str]] = set()
+            for row in place_rows:
+                province = str(row["region"])
+                raw_city = str(row["city"])
+                city = canonical_subregion(province, raw_city) or raw_city
+                created_at = str(row["created_at"] or now_utc_iso())
+                updated_at = (
+                    str(row["updated_at"] or created_at)
+                    if "updated_at" in cols
+                    else created_at
+                )
+                payload.append(
+                    {
+                        "legacy_sqlite_id": int(row["id"]),
+                        "region": province,
+                        "city": city,
+                        "place_name": str(row["place_name"]),
+                        "category": str(row["category"]),
+                        "visit_date": row["visit_date"],
+                        "rating": int(row["rating"]),
+                        "one_line_review": str(row["one_line_review"]),
+                        "latitude": float(row["latitude"]),
+                        "longitude": float(row["longitude"]),
+                        "created_at": created_at,
+                        "updated_at": updated_at,
+                    }
+                )
+                if province in ADMIN_AREAS and city in ADMIN_AREAS[province]:
+                    visited_pairs.add((province, city))
+
+            for start in range(0, len(payload), 200):
+                client.table("places").upsert(
+                    payload[start:start + 200],
+                    on_conflict="legacy_sqlite_id",
+                ).execute()
+            imported_place_count = len(payload)
+
+            if visited_pairs:
+                now = now_utc_iso()
+                client.table("area_status").upsert(
+                    [
+                        {
+                            "province": province,
+                            "subregion": city,
+                            "status": "가본 곳",
+                            "updated_at": now,
+                        }
+                        for province, city in sorted(visited_pairs)
+                    ],
+                    on_conflict="province,subregion",
+                ).execute()
+
+    return imported_area_count, imported_place_count
 
 
 def safe(value: object) -> str:
@@ -525,6 +668,20 @@ def build_map(
     return m
 
 
+def canonical_subregion(province: str, raw_city: str) -> Optional[str]:
+    """기존 SQLite의 상세 주소를 현재 시·군·구 분류명으로 정규화합니다."""
+    if province not in ADMIN_AREAS:
+        return None
+    city = str(raw_city).strip()
+    if city in ADMIN_AREAS[province]:
+        return city
+    # 예: "전주시 완산구" -> "전주시", "서울특별시 강남구" -> "강남구"
+    matches = [name for name in ADMIN_AREAS[province] if name in city]
+    if not matches:
+        return None
+    return max(matches, key=len)
+
+
 def parse_date(value: object) -> date:
     if value is None or pd.isna(value) or str(value).strip() == "":
         return date.today()
@@ -534,7 +691,20 @@ def parse_date(value: object) -> date:
         return date.today()
 
 
-init_db()
+SUPABASE_URL, SUPABASE_SECRET_KEY, APP_PASSWORD = get_app_config()
+require_app_password(APP_PASSWORD)
+supabase_client = get_supabase_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+st.session_state["supabase_client"] = supabase_client
+verify_supabase_schema(supabase_client)
+if not st.session_state.get("supabase_area_seeded"):
+    ensure_area_reference_rows(supabase_client)
+    st.session_state["supabase_area_seeded"] = True
+
+with st.sidebar:
+    st.success("☁️ Supabase 연결됨")
+    if st.button("로그아웃", use_container_width=True):
+        st.session_state.pop("travel_auth_hash", None)
+        st.rerun()
 
 st.markdown(
     """
@@ -892,7 +1062,7 @@ with tab_records:
                     st.rerun()
 
 with tab_backup:
-    st.subheader("CSV 백업")
+    st.subheader("백업 및 기존 SQLite 이전")
     current_places = load_places()
 
     st.download_button(
@@ -910,9 +1080,37 @@ with tab_backup:
         use_container_width=True,
     )
 
-    st.warning(
-        "Streamlit Community Cloud의 로컬 SQLite 파일은 앱 재부팅·재배포 시 유실될 수 있습니다. "
-        "장기 보관용 배포에서는 Supabase 같은 외부 DB 연결을 권장합니다."
-    )
+    st.success("현재 장소 기록과 방문 상태는 Supabase PostgreSQL에 영구 저장됩니다.")
 
-st.caption("개인 여행 기록 v2 · OpenStreetMap + Streamlit + Folium + SQLite")
+    st.divider()
+    st.subheader("기존 SQLite 데이터 가져오기")
+    if DB_PATH.exists():
+        st.caption(
+            "기존 `travel_log.db`의 방문 상태와 장소 기록을 Supabase로 옮깁니다. "
+            "같은 SQLite ID는 다시 실행해도 중복 생성되지 않습니다."
+        )
+        migration_confirm = st.checkbox(
+            "기존 SQLite 데이터를 Supabase로 가져옵니다.",
+            key="sqlite_migration_confirm",
+        )
+        if st.button(
+            "SQLite → Supabase 이전 실행",
+            type="primary",
+            disabled=not migration_confirm,
+            use_container_width=True,
+        ):
+            try:
+                area_count, migrated_place_count = migrate_sqlite_to_supabase()
+                st.success(
+                    f"이전 완료: 방문 상태 {area_count}개, 장소 기록 {migrated_place_count}개"
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error("SQLite 데이터 이전 중 오류가 발생했습니다.")
+                st.code(str(exc))
+    else:
+        st.info(
+            "현재 프로젝트 폴더에 `travel_log.db`가 없습니다. 기존 데이터가 없다면 정상입니다."
+        )
+
+st.caption("개인 여행 기록 v3 · OpenStreetMap + Streamlit + Folium + Supabase")
