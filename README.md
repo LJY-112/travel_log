@@ -1,29 +1,51 @@
-# 나의 대한민국 여행 기록 v3
+# 나의 대한민국 여행 기록 v4
 
-OpenStreetMap + Streamlit + Supabase PostgreSQL 기반 개인 여행 기록 웹앱입니다.
+OpenStreetMap + Streamlit + Supabase PostgreSQL/Storage 기반 개인 여행 기록 앱입니다.
 
-## v3 핵심 변경
+## v4 추가 기능
 
-- SQLite 대신 Supabase PostgreSQL에 장소와 방문 상태 영구 저장
-- Streamlit Secrets를 통한 Supabase URL 및 Secret key 관리
-- 간단한 앱 비밀번호 로그인
-- 기존 `travel_log.db` 데이터를 Supabase로 중복 없이 이전
-- CSV 백업 유지
+- 장소를 새로 저장할 때 사진을 함께 업로드
+- 기존 장소에 사진 추가
+- 장소별 3열 사진 갤러리
+- 사진 설명 수정
+- 대표사진 지정
+- 개별 사진 삭제
+- 장소 삭제 시 Storage의 연결 사진도 함께 삭제
+- 비공개 Supabase Storage bucket과 1시간짜리 signed URL 사용
 
-## 1. Supabase 프로젝트 생성
+## 업데이트 순서
 
-1. Supabase에서 새 프로젝트를 만듭니다.
-2. 프로젝트 Dashboard의 **SQL Editor**를 엽니다.
-3. 이 프로젝트에 포함된 `supabase_schema.sql` 전체를 붙여넣고 실행합니다.
-4. **Project Settings → API Keys**에서 다음 값을 확인합니다.
-   - Project URL
-   - Secret key (`sb_secret_...`)
+1. Supabase Dashboard의 **SQL Editor**에서 최신 `supabase_schema.sql` 전체를 다시 실행합니다.
+   - 기존 `places`, `area_status` 데이터는 삭제되지 않습니다.
+   - `place_photos` 테이블과 `travel-photos` Storage bucket이 추가됩니다.
+2. 기존 프로젝트의 `streamlit_app.py`, `supabase_schema.sql`, `README.md`를 v4 파일로 교체합니다.
+3. 패키지를 확인하고 앱을 다시 실행합니다.
 
-Secret key는 서버 전용입니다. GitHub, 채팅, 화면 캡처, 클라이언트 JavaScript에 공개하면 안 됩니다.
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run streamlit_app.py
+```
 
-## 2. 로컬 Secrets 설정
+## 사진 사용법
 
-프로젝트 폴더에 `.streamlit/secrets.toml`을 만듭니다.
+### 새 장소와 함께 업로드
+
+`여행 지도 → 새 장소 기록`에서 장소 정보와 사진을 선택합니다.
+한 번에 최대 8장, 각 파일은 10MB 이하이며 JPG/JPEG/PNG/WEBP를 지원합니다.
+첫 번째 사진은 자동으로 대표사진이 됩니다.
+
+### 기존 장소에 추가
+
+`사진 갤러리` 탭에서 장소를 선택하고 사진을 업로드합니다.
+사진 아래의 `사진 정보 수정·삭제`에서 설명, 대표사진, 삭제를 관리합니다.
+
+## Storage 보안
+
+`travel-photos` bucket은 비공개입니다. 앱은 Supabase Secret key를 서버에서만 사용하고,
+화면 표시 시 1시간 동안 유효한 signed URL을 생성합니다. Secret key와
+`.streamlit/secrets.toml`은 GitHub에 올리지 마세요.
+
+## Secrets
 
 ```toml
 [supabase]
@@ -33,57 +55,3 @@ secret_key = "sb_secret_YOUR_SECRET_KEY"
 [app]
 password = "나만의-접속-비밀번호"
 ```
-
-`secrets.toml`은 `.gitignore`에 포함되어 있으므로 GitHub에 업로드하지 않습니다.
-
-## 3. 로컬 실행
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m streamlit run streamlit_app.py
-```
-
-## 4. 기존 SQLite 기록 이전
-
-기존 `travel_log.db`를 `streamlit_app.py`와 같은 폴더에 둡니다.
-앱 로그인 후 **백업 → 기존 SQLite 데이터 가져오기**에서 이전 버튼을 누릅니다.
-
-- `area_status` 방문 상태를 upsert
-- `places` 장소 기록을 이전
-- 기존 SQLite ID를 `legacy_sqlite_id`로 저장
-- 같은 이전 작업을 다시 실행해도 장소가 중복되지 않음
-
-이전 완료 후에도 안전을 위해 원본 `travel_log.db`를 별도로 보관하세요.
-
-## 5. Streamlit Community Cloud 배포
-
-GitHub에는 다음 파일을 올립니다.
-
-```text
-streamlit_app.py
-requirements.txt
-supabase_schema.sql
-README.md
-.gitignore
-```
-
-Community Cloud 앱 설정에서:
-
-```text
-Repository: 본인의 GitHub 저장소
-Branch: main
-Main file path: streamlit_app.py
-```
-
-**App settings → Secrets**에 로컬 `secrets.toml`과 같은 내용을 입력합니다.
-
-## 보안 구조
-
-- Supabase 테이블에는 RLS가 활성화됩니다.
-- `anon` 및 `authenticated` 역할에는 테이블 권한을 부여하지 않습니다.
-- Streamlit 서버만 Secret key로 DB에 접근합니다.
-- 앱 자체에는 별도의 접속 비밀번호가 적용됩니다.
-
-이 구조는 개인용 단일 사용자 앱에 적합합니다. 여러 사용자가 각자 계정을 갖는 서비스로 확장할 때는 Supabase Auth와 `user_id` 기반 RLS 정책으로 변경해야 합니다.

@@ -4,6 +4,9 @@ import hashlib
 import hmac
 import html
 import sqlite3
+import mimetypes
+import re
+import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -17,6 +20,9 @@ from supabase import Client, create_client
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "travel_log.db"
+PHOTO_BUCKET = "travel-photos"
+MAX_PHOTOS_PER_UPLOAD = 8
+MAX_PHOTO_BYTES = 10 * 1024 * 1024
 
 PROVINCE_CENTERS = {
     "서울특별시": (37.5665, 126.9780),
@@ -260,6 +266,7 @@ def verify_supabase_schema(client: Client) -> None:
     try:
         client.table("area_status").select("province", count="exact").limit(1).execute()
         client.table("places").select("id", count="exact").limit(1).execute()
+        client.table("place_photos").select("id", count="exact").limit(1).execute()
     except Exception as exc:
         st.error("Supabase에는 연결했지만 필요한 테이블을 확인할 수 없습니다.")
         st.info("프로젝트에 포함된 `supabase_schema.sql`을 Supabase SQL Editor에서 먼저 실행하세요.")
@@ -376,10 +383,10 @@ def add_place(
     review: str,
     latitude: float,
     longitude: float,
-) -> None:
+) -> int:
     client = st.session_state["supabase_client"]
     now = now_utc_iso()
-    client.table("places").insert(
+    response = client.table("places").insert(
         {
             "region": region,
             "city": city,
@@ -395,6 +402,10 @@ def add_place(
         }
     ).execute()
     update_area_status(region, city, "가본 곳")
+    rows = response.data or []
+    if not rows:
+        raise RuntimeError("저장된 장소 ID를 확인하지 못했습니다.")
+    return int(rows[0]["id"])
 
 
 def update_place(
@@ -434,7 +445,122 @@ def update_place(
 
 def delete_place(place_id: int) -> None:
     client = st.session_state["supabase_client"]
+    delete_all_place_photos(int(place_id))
     client.table("places").delete().eq("id", int(place_id)).execute()
+
+
+
+def sanitize_filename(filename: str) -> str:
+    """Storage 경로에 안전한 파일명 일부를 만듭니다."""
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix.lower()
+    clean = re.sub(r"[^0-9A-Za-z가-힣_-]+", "-", stem).strip("-_")
+    return f"{clean[:50] or 'photo'}{suffix}"
+
+
+def load_place_photos(place_id: Optional[int] = None) -> pd.DataFrame:
+    client = st.session_state["supabase_client"]
+    columns = [
+        "id", "place_id", "storage_path", "original_name", "caption",
+        "is_cover", "sort_order", "created_at",
+    ]
+    query = client.table("place_photos").select(",".join(columns))
+    if place_id is not None:
+        query = query.eq("place_id", int(place_id))
+    response = query.order("is_cover", desc=True).order("sort_order").order("id").execute()
+    return pd.DataFrame(response.data or [], columns=columns)
+
+
+def signed_photo_url(storage_path: str, expires_in: int = 3600) -> str:
+    client = st.session_state["supabase_client"]
+    response = client.storage.from_(PHOTO_BUCKET).create_signed_url(storage_path, expires_in)
+    if isinstance(response, dict):
+        return str(response.get("signedURL") or response.get("signed_url") or "")
+    return str(getattr(response, "signed_url", "") or getattr(response, "signedURL", ""))
+
+
+def upload_place_photos(place_id: int, uploaded_files: list[Any]) -> int:
+    """여러 이미지를 Storage에 저장하고 메타데이터 행을 생성합니다."""
+    if not uploaded_files:
+        return 0
+    if len(uploaded_files) > MAX_PHOTOS_PER_UPLOAD:
+        raise ValueError(f"한 번에 최대 {MAX_PHOTOS_PER_UPLOAD}장까지 업로드할 수 있습니다.")
+
+    client = st.session_state["supabase_client"]
+    existing = load_place_photos(place_id)
+    existing_count = len(existing)
+    uploaded_paths: list[str] = []
+    metadata: list[dict[str, Any]] = []
+
+    try:
+        for index, uploaded in enumerate(uploaded_files):
+            raw = uploaded.getvalue()
+            if len(raw) > MAX_PHOTO_BYTES:
+                raise ValueError(f"{uploaded.name}: 파일 크기가 10MB를 초과합니다.")
+            content_type = str(getattr(uploaded, "type", "") or mimetypes.guess_type(uploaded.name)[0] or "")
+            if not content_type.startswith("image/"):
+                raise ValueError(f"{uploaded.name}: 이미지 파일만 업로드할 수 있습니다.")
+
+            safe_name = sanitize_filename(uploaded.name)
+            storage_path = f"places/{int(place_id)}/{uuid.uuid4().hex}_{safe_name}"
+            client.storage.from_(PHOTO_BUCKET).upload(
+                path=storage_path,
+                file=raw,
+                file_options={"content-type": content_type, "upsert": "false"},
+            )
+            uploaded_paths.append(storage_path)
+            metadata.append(
+                {
+                    "place_id": int(place_id),
+                    "storage_path": storage_path,
+                    "original_name": str(uploaded.name),
+                    "caption": "",
+                    "is_cover": existing_count == 0 and index == 0,
+                    "sort_order": existing_count + index,
+                    "created_at": now_utc_iso(),
+                }
+            )
+        if metadata:
+            client.table("place_photos").insert(metadata).execute()
+        return len(metadata)
+    except Exception:
+        if uploaded_paths:
+            try:
+                client.storage.from_(PHOTO_BUCKET).remove(uploaded_paths)
+            except Exception:
+                pass
+        raise
+
+
+def update_photo_metadata(photo_id: int, caption: str, is_cover: bool, place_id: int) -> None:
+    client = st.session_state["supabase_client"]
+    if is_cover:
+        client.table("place_photos").update({"is_cover": False}).eq("place_id", int(place_id)).execute()
+    client.table("place_photos").update(
+        {"caption": caption.strip(), "is_cover": bool(is_cover)}
+    ).eq("id", int(photo_id)).execute()
+
+
+def delete_photo(photo_id: int) -> None:
+    client = st.session_state["supabase_client"]
+    response = client.table("place_photos").select("storage_path").eq("id", int(photo_id)).limit(1).execute()
+    rows = response.data or []
+    if not rows:
+        return
+    storage_path = str(rows[0]["storage_path"])
+    client.storage.from_(PHOTO_BUCKET).remove([storage_path])
+    client.table("place_photos").delete().eq("id", int(photo_id)).execute()
+
+
+def delete_all_place_photos(place_id: int) -> None:
+    photos = load_place_photos(place_id)
+    if photos.empty:
+        return
+    client = st.session_state["supabase_client"]
+    paths = photos["storage_path"].astype(str).tolist()
+    if paths:
+        client.storage.from_(PHOTO_BUCKET).remove(paths)
+    client.table("place_photos").delete().eq("place_id", int(place_id)).execute()
 
 
 def sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -734,8 +860,8 @@ m2.metric("가고 싶은 시·군·구", wishlist_count)
 m3.metric("저장한 장소", place_count)
 m4.metric("기록이 있는 시·군·구", area_place_count)
 
-tab_map, tab_regions, tab_records, tab_backup = st.tabs(
-    ["🗺️ 여행 지도", "🏙️ 시·군·구 현황", "📝 장소 기록 관리", "💾 백업"]
+tab_map, tab_regions, tab_records, tab_gallery, tab_backup = st.tabs(
+    ["🗺️ 여행 지도", "🏙️ 시·군·구 현황", "📝 장소 기록 관리", "📷 사진 갤러리", "💾 백업"]
 )
 
 with tab_map:
@@ -822,12 +948,18 @@ with tab_map:
             key="new_longitude",
         )
 
+        new_photos = st.file_uploader(
+            "장소 사진 (선택 · 최대 8장 · 장당 10MB)",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            help="첫 번째 사진이 자동으로 대표사진이 됩니다.",
+        )
         submitted = st.form_submit_button("📍 지도에 장소 저장", use_container_width=True)
         if submitted:
             if not place_name.strip() or not review.strip():
                 st.error("장소명과 한줄평을 모두 입력해 주세요.")
             else:
-                add_place(
+                new_place_id = add_place(
                     region=new_province,
                     city=new_subregion,
                     place_name=place_name,
@@ -838,8 +970,13 @@ with tab_map:
                     latitude=latitude,
                     longitude=longitude,
                 )
+                uploaded_count = upload_place_photos(new_place_id, list(new_photos or []))
                 st.session_state.pop("last_processed_click", None)
-                st.success("장소가 저장되었고 해당 시·군·구가 '가본 곳'으로 변경되었습니다.")
+                st.success(
+                    f"장소가 저장되었습니다. 사진 {uploaded_count}장도 함께 저장했습니다."
+                    if uploaded_count else
+                    "장소가 저장되었고 해당 시·군·구가 '가본 곳'으로 변경되었습니다."
+                )
                 st.rerun()
 
 with tab_regions:
@@ -1061,6 +1198,108 @@ with tab_records:
                     st.success("기록을 삭제했습니다.")
                     st.rerun()
 
+
+with tab_gallery:
+    st.subheader("장소별 사진 갤러리")
+    gallery_places = load_places()
+    if gallery_places.empty:
+        st.warning("먼저 장소 기록을 추가해 주세요.")
+    else:
+        g1, g2 = st.columns([2, 1])
+        gallery_place_id = g1.selectbox(
+            "갤러리를 볼 장소",
+            options=gallery_places["id"].tolist(),
+            format_func=lambda x: (
+                f"#{x} · {gallery_places.loc[gallery_places['id'] == x, 'place_name'].iloc[0]} · "
+                f"{gallery_places.loc[gallery_places['id'] == x, 'city'].iloc[0]}"
+            ),
+            key="gallery_place_id",
+        )
+        selected_place = gallery_places[gallery_places["id"] == gallery_place_id].iloc[0]
+        g2.metric("현재 사진", len(load_place_photos(int(gallery_place_id))))
+        st.caption(
+            f"{selected_place['region']} · {selected_place['city']} · "
+            f"{selected_place['place_name']}"
+        )
+
+        with st.form(f"gallery_upload_{gallery_place_id}", clear_on_submit=True):
+            gallery_uploads = st.file_uploader(
+                "사진 추가",
+                type=["jpg", "jpeg", "png", "webp"],
+                accept_multiple_files=True,
+                help="한 번에 최대 8장, 각 파일은 10MB 이하입니다.",
+                key=f"gallery_files_{gallery_place_id}",
+            )
+            upload_submit = st.form_submit_button(
+                "선택한 사진 업로드",
+                type="primary",
+                use_container_width=True,
+            )
+            if upload_submit:
+                try:
+                    count = upload_place_photos(int(gallery_place_id), list(gallery_uploads or []))
+                    if count:
+                        st.success(f"사진 {count}장을 업로드했습니다.")
+                        st.rerun()
+                    else:
+                        st.warning("업로드할 사진을 선택해 주세요.")
+                except Exception as exc:
+                    st.error("사진 업로드에 실패했습니다.")
+                    st.code(str(exc))
+
+        photos_df = load_place_photos(int(gallery_place_id))
+        if photos_df.empty:
+            st.info("이 장소에는 아직 사진이 없습니다.")
+        else:
+            st.divider()
+            columns = st.columns(3)
+            for index, photo in enumerate(photos_df.itertuples(index=False)):
+                with columns[index % 3]:
+                    try:
+                        photo_url = signed_photo_url(str(photo.storage_path))
+                        if photo_url:
+                            st.image(
+                                photo_url,
+                                caption=("대표사진 · " if bool(photo.is_cover) else "")
+                                + (str(photo.caption).strip() or str(photo.original_name)),
+                                use_container_width=True,
+                            )
+                        else:
+                            st.warning("사진 URL을 만들지 못했습니다.")
+                    except Exception as exc:
+                        st.warning(f"사진을 불러오지 못했습니다: {exc}")
+
+                    with st.expander("사진 정보 수정·삭제"):
+                        with st.form(f"photo_meta_{photo.id}"):
+                            caption = st.text_input(
+                                "사진 설명",
+                                value=str(photo.caption or ""),
+                                max_chars=150,
+                            )
+                            is_cover = st.checkbox("대표사진으로 지정", value=bool(photo.is_cover))
+                            save_photo = st.form_submit_button("사진 정보 저장")
+                            if save_photo:
+                                update_photo_metadata(
+                                    int(photo.id), caption, is_cover, int(gallery_place_id)
+                                )
+                                st.success("사진 정보를 저장했습니다.")
+                                st.rerun()
+                        delete_confirm = st.checkbox(
+                            "이 사진을 삭제합니다.", key=f"photo_delete_confirm_{photo.id}"
+                        )
+                        if st.button(
+                            "사진 삭제",
+                            disabled=not delete_confirm,
+                            key=f"photo_delete_{photo.id}",
+                        ):
+                            try:
+                                delete_photo(int(photo.id))
+                                st.success("사진을 삭제했습니다.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error("사진 삭제에 실패했습니다.")
+                                st.code(str(exc))
+
 with tab_backup:
     st.subheader("백업 및 기존 SQLite 이전")
     current_places = load_places()
@@ -1113,4 +1352,4 @@ with tab_backup:
             "현재 프로젝트 폴더에 `travel_log.db`가 없습니다. 기존 데이터가 없다면 정상입니다."
         )
 
-st.caption("개인 여행 기록 v3 · OpenStreetMap + Streamlit + Folium + Supabase")
+st.caption("개인 여행 기록 v4 · OpenStreetMap + Streamlit + Supabase Storage 사진 갤러리")
