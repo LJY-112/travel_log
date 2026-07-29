@@ -1,5 +1,6 @@
 .venv/
 __pycache__/
 *.pyc
-travel_log.db
 .streamlit/secrets.toml
+travel_log.db
+travel_log_backup.db
