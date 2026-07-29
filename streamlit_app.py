@@ -128,11 +128,54 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .block-container {padding-top: 1.3rem; padding-bottom: 3rem; max-width: 1500px;}
-    .travel-title {font-size: 2.15rem; font-weight: 800; margin-bottom: .15rem;}
-    .travel-sub {color: #64748b; margin-bottom: 1rem;}
+    /* Streamlit 상단 고정 헤더와 겹치지 않도록 충분한 안전 여백을 둡니다. */
+    .block-container {
+        padding-top: 4.75rem !important;
+        padding-bottom: 3rem;
+        max-width: 1500px;
+    }
+
+    /* 한글 상단 획과 이모지가 잘리지 않도록 line-height와 내부 여백을 명시합니다. */
+    .travel-title {
+        display: flex;
+        align-items: center;
+        gap: 0.55rem;
+        min-height: 3.4rem;
+        margin: 0 0 0.15rem 0;
+        padding: 0.25rem 0 0.15rem 0;
+        overflow: visible;
+        font-size: 2.15rem;
+        font-weight: 800;
+        line-height: 1.35;
+        letter-spacing: -0.025em;
+    }
+
+    .travel-title-icon {
+        display: inline-flex;
+        align-items: center;
+        line-height: 1;
+        flex: 0 0 auto;
+    }
+
+    .travel-title-text {
+        display: inline-block;
+        line-height: 1.35;
+        overflow: visible;
+    }
+
+    .travel-sub {
+        color: #64748b;
+        margin: 0 0 1rem 0;
+        line-height: 1.6;
+    }
+
     div[data-testid="stForm"] {border-radius: 14px;}
     iframe {border-radius: 14px;}
+
+    @media (max-width: 768px) {
+        .block-container {padding-top: 4.35rem !important;}
+        .travel-title {font-size: 1.75rem; min-height: 3rem;}
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -493,7 +536,15 @@ def parse_date(value: object) -> date:
 
 init_db()
 
-st.markdown('<div class="travel-title">🧭 나의 대한민국 여행 기록</div>', unsafe_allow_html=True)
+st.markdown(
+    """
+    <div class="travel-title">
+        <span class="travel-title-icon">🧭</span>
+        <span class="travel-title-text">나의 대한민국 여행 기록</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 st.markdown(
     '<div class="travel-sub">OpenStreetMap에서 위치를 선택하고, 시·군·구별 방문 상태와 장소 기록을 관리합니다.</div>',
     unsafe_allow_html=True,
