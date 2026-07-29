@@ -1,20 +1,20 @@
-# 나의 대한민국 여행 기록
+# 나의 대한민국 여행 기록 v2
 
-Python, Streamlit, Folium, SQLite로 만든 개인 여행 기록 웹앱입니다.
+Python, Streamlit, Folium, OpenStreetMap, SQLite로 만든 개인 여행 기록 웹앱입니다.
 
-## 주요 기능
+## v2 변경 사항
 
-- 대한민국 17개 광역자치단체를 `가본 곳 / 가고 싶은 곳 / 미방문`으로 분류
-- 지도 클릭으로 장소 위도와 경도 입력
-- 음식점, 카페, 관광명소, 숙소 등 장소 마커 저장
-- 방문일, 별점, 한줄평 기록
-- 지역·카테고리·검색어 필터
-- 기록 삭제
-- CSV 백업
+- 기본 지도를 OpenStreetMap 표준 지도로 변경
+- 지도 높이 확대 및 전체 화면 버튼 추가
+- 17개 광역자치단체 아래에 시·군·구 229개 여행 분류 항목 추가
+- 시·군·구별 `가본 곳 / 가고 싶은 곳 / 미방문` 상태 관리
+- 지도와 장소 목록을 광역자치단체 및 시·군·구로 필터링
+- 기존 장소 기록의 장소명, 지역, 카테고리, 방문일, 평점, 한줄평, 좌표 수정
+- 구버전 SQLite 데이터베이스 자동 호환
 
-## 1. 로컬 설치
+## 로컬 실행
 
-PowerShell에서 프로젝트 폴더로 이동한 뒤 실행합니다.
+PowerShell에서 프로젝트 폴더로 이동합니다.
 
 ```powershell
 py -m venv .venv
@@ -23,44 +23,32 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -m streamlit run streamlit_app.py
 ```
 
-PowerShell 실행 정책 때문에 activate가 되지 않아도 위 명령은 작동합니다.
+PowerShell 실행 정책 때문에 가상환경 활성화가 되지 않아도 위 방식으로 실행할 수 있습니다.
 
-## 2. GitHub 구조
+## 기존 버전에서 업데이트
+
+기존 폴더의 `streamlit_app.py`를 새 파일로 교체하고 앱을 다시 실행하면 됩니다.
+
+기존 `travel_log.db`를 그대로 두면 장소 기록은 유지됩니다. 최초 실행 시 다음 작업이 자동으로 수행됩니다.
+
+- `area_status` 테이블 생성
+- 장소 기록에 `updated_at` 열 추가
+- 기존 도시명이 새 시·군·구 이름과 일치하는 경우 해당 지역을 `가본 곳`으로 전환
+
+중요한 데이터는 업데이트 전에 `travel_log.db`를 별도로 복사해 두는 것을 권장합니다.
+
+## Streamlit Community Cloud
+
+- Repository: GitHub 저장소
+- Branch: `main`
+- Main file path: `streamlit_app.py`
+
+하위 폴더에 저장했다면 예시는 다음과 같습니다.
 
 ```text
-korea_travel_log/
-├─ streamlit_app.py
-├─ requirements.txt
-├─ README.md
-└─ travel_log.db       # 최초 실행 시 자동 생성
+korea_travel_log/streamlit_app.py
 ```
 
-개인 기록이 들어 있는 `travel_log.db`를 공개 저장소에 올리지 않는 것을 권장합니다.
+## 데이터 영구 저장 주의
 
-`.gitignore` 예시:
-
-```gitignore
-.venv/
-__pycache__/
-travel_log.db
-.streamlit/secrets.toml
-```
-
-## 3. Streamlit Community Cloud 배포
-
-1. 위 파일을 GitHub 저장소에 업로드합니다.
-2. Streamlit Community Cloud에서 새 앱을 생성합니다.
-3. Repository: 본인의 저장소
-4. Branch: `main`
-5. Main file path: `streamlit_app.py`
-6. Deploy를 누릅니다.
-
-## 중요: 데이터 영구 저장
-
-이 버전은 로컬 SQLite를 사용합니다.
-
-- 개인 PC에서 실행: 기록이 계속 유지됩니다.
-- Streamlit Community Cloud: 앱 재시작이나 재배포 시 DB 파일이 초기화될 수 있습니다.
-
-실제 장기 운영은 Supabase(PostgreSQL) 연결을 권장합니다. 다음 버전에서
-사용자 로그인, 사진 저장, Supabase DB를 붙일 수 있습니다.
+로컬 PC에서는 `travel_log.db`가 유지됩니다. Streamlit Community Cloud의 로컬 파일은 재배포나 앱 재시작 때 초기화될 수 있으므로 장기 운영에는 Supabase 같은 외부 데이터베이스가 적합합니다.
